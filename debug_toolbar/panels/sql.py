@@ -1,21 +1,22 @@
+import re
 import uuid
-from copy import copy
+import sqlparse
 
 from django.db.backends import BaseDatabaseWrapper
+from django.utils.html import escape
 from django.utils.translation import ugettext_lazy as _, ungettext_lazy as __
+from django.utils.six import itervalues
 
-from debug_toolbar.forms import SQLSelectForm
 from debug_toolbar.utils.compat.db import connections
 from debug_toolbar.middleware import DebugToolbarMiddleware
 from debug_toolbar.panels import DebugPanel
 from debug_toolbar.utils import render_stacktrace
-from debug_toolbar.utils.sql import reformat_sql
 from debug_toolbar.utils.tracking.db import CursorWrapper
-from debug_toolbar.utils.tracking import replace_call
+from debug_toolbar.utils.tracking import monkey_patch_call
 
 
 # Inject our tracking cursor
-@replace_call(BaseDatabaseWrapper.cursor)
+@monkey_patch_call(BaseDatabaseWrapper, 'cursor')
 def cursor(func, self):
     result = func(self)
 
@@ -25,6 +26,8 @@ def cursor(func, self):
     logger = djdt.get_panel(SQLDebugPanel)
 
     return CursorWrapper(result, self, logger=logger)
+
+BaseDatabaseWrapper.cursor = cursor
 
 
 def get_isolation_level_display(engine, level):
@@ -77,11 +80,9 @@ class SQLDebugPanel(DebugPanel):
         self._transaction_ids = {}
 
     def get_transaction_id(self, alias):
-        if alias not in connections:
-            return
         conn = connections[alias].connection
         if not conn:
-            return
+            return None
 
         engine = conn.__class__.__module__.split('.', 1)[0]
         if engine == 'psycopg2':
@@ -137,7 +138,7 @@ class SQLDebugPanel(DebugPanel):
         if self._queries:
             width_ratio_tally = 0
             factor = int(256.0 / (len(self._databases) * 2.5))
-            for n, db in enumerate(self._databases.itervalues()):
+            for n, db in enumerate(itervalues(self._databases)):
                 rgb = [0, 0, 0]
                 color = n % 3
                 rgb[color] = 256 - n / 3 * factor
@@ -173,9 +174,6 @@ class SQLDebugPanel(DebugPanel):
                     query['iso_level'] = get_isolation_level_display(query['engine'], query['iso_level'])
                 if 'trans_status' in query:
                     query['trans_status'] = get_transaction_status_display(query['engine'], query['trans_status'])
-
-                query['form'] = SQLSelectForm(auto_id=None, initial=copy(query))
-
                 if query['sql']:
                     query['sql'] = reformat_sql(query['sql'])
                 query['rgb_color'] = self._databases[alias]['rgb_color']
@@ -199,3 +197,28 @@ class SQLDebugPanel(DebugPanel):
             'queries': [q for a, q in self._queries],
             'sql_time': self._sql_time,
         })
+
+
+class BoldKeywordFilter():
+    """sqlparse filter to bold SQL keywords"""
+    def process(self, stack, stream):
+        """Process the token stream"""
+        for token_type, value in stream:
+            is_keyword = token_type in sqlparse.tokens.Keyword
+            if is_keyword:
+                yield sqlparse.tokens.Text, '<strong>'
+            yield token_type, escape(value)
+            if is_keyword:
+                yield sqlparse.tokens.Text, '</strong>'
+
+
+def swap_fields(sql):
+    return re.sub('SELECT</strong> (.*?) <strong>FROM', 'SELECT</strong> <a class="djDebugUncollapsed djDebugToggle" href="#">&bull;&bull;&bull;</a> ' +
+        '<a class="djDebugCollapsed djDebugToggle" href="#">\g<1></a> <strong>FROM', sql)
+
+
+def reformat_sql(sql):
+    stack = sqlparse.engine.FilterStack()
+    stack.preprocess.append(BoldKeywordFilter())  # add our custom filter
+    stack.postprocess.append(sqlparse.filters.SerializerUnicode())  # tokens -> strings
+    return swap_fields(''.join(stack.run(sql)))

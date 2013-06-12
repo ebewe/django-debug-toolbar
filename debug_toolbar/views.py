@@ -4,9 +4,15 @@ debug toolbar is displayed, and typically can do Bad Things, so hooking up these
 views in any other way is generally not advised.
 """
 
+import os
+import django.views.static
+from django.conf import settings
 from django.http import HttpResponseBadRequest
 from django.shortcuts import render_to_response
-from django.views.decorators.csrf import csrf_exempt
+
+from debug_toolbar.utils.compat.db import connections
+
+from django.utils.encoding import force_bytes
 
 try:
     import json
@@ -18,44 +24,76 @@ try:
 except ImportError: # python < 2.5
     from django.utils.hashcompat import sha_constructor as sha1
 
-from debug_toolbar.forms import SQLSelectForm
+
+def sha1_hexdigest(text_or_bytes):
+    return sha1(force_bytes(text_or_bytes)).hexdigest()
 
 
-@csrf_exempt
+class InvalidSQLError(Exception):
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return repr(self.value)
+
+
 def sql_select(request):
-    """Returns the output of the SQL SELECT statement"""
-    form = SQLSelectForm(request.POST or None)
+    """
+    Returns the output of the SQL SELECT statement.
 
-    if form.is_valid():
-        sql = form.cleaned_data['sql']
-        params = form.cleaned_data['params']
-        cursor = form.cursor
+    Expected GET variables:
+        sql: urlencoded sql with positional arguments
+        params: JSON encoded parameter values
+        duration: time for SQL to execute passed in from toolbar just for redisplay
+        hash: the hash of (secret + sql + params) for tamper checking
+    """
+    from debug_toolbar.panels.sql import reformat_sql
+    sql = request.GET.get('sql', '')
+    params = request.GET.get('params', '')
+    alias = request.GET.get('alias', 'default')
+    hash = sha1_hexdigest(settings.SECRET_KEY + sql + params)
+    if hash != request.GET.get('hash', ''):
+        return HttpResponseBadRequest('Tamper alert')  # SQL Tampering alert
+    if sql.lower().strip().startswith('select'):
+        params = json.loads(params)
+        cursor = connections[alias].cursor()
         cursor.execute(sql, params)
         headers = [d[0] for d in cursor.description]
         result = cursor.fetchall()
         cursor.close()
         context = {
             'result': result,
-            'sql': form.reformat_sql(),
-            'duration': form.cleaned_data['duration'],
+            'sql': reformat_sql(cursor.db.ops.last_executed_query(cursor, sql, params)),
+            'duration': request.GET.get('duration', 0.0),
             'headers': headers,
-            'alias': form.cleaned_data['alias'],
+            'alias': alias,
         }
         return render_to_response('debug_toolbar/panels/sql_select.html', context)
-    return HttpResponseBadRequest('Form errors')
+    raise InvalidSQLError("Only 'select' queries are allowed.")
 
 
-@csrf_exempt
 def sql_explain(request):
-    """Returns the output of the SQL EXPLAIN on the given query"""
-    form = SQLSelectForm(request.POST or None)
+    """
+    Returns the output of the SQL EXPLAIN on the given query.
 
-    if form.is_valid():
-        sql = form.cleaned_data['sql']
-        params = form.cleaned_data['params']
-        cursor = form.cursor
+    Expected GET variables:
+        sql: urlencoded sql with positional arguments
+        params: JSON encoded parameter values
+        duration: time for SQL to execute passed in from toolbar just for redisplay
+        hash: the hash of (secret + sql + params) for tamper checking
+    """
+    from debug_toolbar.panels.sql import reformat_sql
+    sql = request.GET.get('sql', '')
+    params = request.GET.get('params', '')
+    alias = request.GET.get('alias', 'default')
+    hash = sha1_hexdigest(settings.SECRET_KEY + sql + params)
+    if hash != request.GET.get('hash', ''):
+        return HttpResponseBadRequest('Tamper alert')  # SQL Tampering alert
+    if sql.lower().strip().startswith('select'):
+        params = json.loads(params)
+        cursor = connections[alias].cursor()
 
-        conn = form.connection
+        conn = connections[alias].connection
         engine = conn.__class__.__module__.split('.', 1)[0]
 
         if engine == "sqlite3":
@@ -73,24 +111,35 @@ def sql_explain(request):
         cursor.close()
         context = {
             'result': result,
-            'sql': form.reformat_sql(),
-            'duration': form.cleaned_data['duration'],
+            'sql': reformat_sql(cursor.db.ops.last_executed_query(cursor, sql, params)),
+            'duration': request.GET.get('duration', 0.0),
             'headers': headers,
-            'alias': form.cleaned_data['alias'],
+            'alias': alias,
         }
         return render_to_response('debug_toolbar/panels/sql_explain.html', context)
-    return HttpResponseBadRequest('Form errors')
+    raise InvalidSQLError("Only 'select' queries are allowed.")
 
 
-@csrf_exempt
 def sql_profile(request):
-    """Returns the output of running the SQL and getting the profiling statistics"""
-    form = SQLSelectForm(request.POST or None)
+    """
+    Returns the output of running the SQL and getting the profiling statistics.
 
-    if form.is_valid():
-        sql = form.cleaned_data['sql']
-        params = form.cleaned_data['params']
-        cursor = form.cursor
+    Expected GET variables:
+        sql: urlencoded sql with positional arguments
+        params: JSON encoded parameter values
+        duration: time for SQL to execute passed in from toolbar just for redisplay
+        hash: the hash of (secret + sql + params) for tamper checking
+    """
+    from debug_toolbar.panels.sql import reformat_sql
+    sql = request.GET.get('sql', '')
+    params = request.GET.get('params', '')
+    alias = request.GET.get('alias', 'default')
+    hash = sha1_hexdigest(settings.SECRET_KEY + sql + params)
+    if hash != request.GET.get('hash', ''):
+        return HttpResponseBadRequest('Tamper alert')  # SQL Tampering alert
+    if sql.lower().strip().startswith('select'):
+        params = json.loads(params)
+        cursor = connections[alias].cursor()
         result = None
         headers = None
         result_error = None
@@ -108,13 +157,13 @@ def sql_profile(request):
         context = {
             'result': result,
             'result_error': result_error,
-            'sql': form.reformat_sql(),
-            'duration': form.cleaned_data['duration'],
+            'sql': reformat_sql(cursor.db.ops.last_executed_query(cursor, sql, params)),
+            'duration': request.GET.get('duration', 0.0),
             'headers': headers,
-            'alias': form.cleaned_data['alias'],
+            'alias': alias,
         }
         return render_to_response('debug_toolbar/panels/sql_profile.html', context)
-    return HttpResponseBadRequest('Form errors')
+    raise InvalidSQLError("Only 'select' queries are allowed.")
 
 
 def template_source(request):
